@@ -8,7 +8,7 @@ using ModelContextProtocol.Protocol;
 
 // Job 2 worker for the MEGA.dev "two places" challenge.
 // It connects to the job's MCP link, follows the voice-to-memo skill with a
-// Claude tool-use loop, and keeps the result (notes + receipt) for the main
+// OpenRouter (OpenAI-style) tool-calling loop, and keeps the result (notes + receipt) for the main
 // agent to fetch from GET /result.
 
 var builder = WebApplication.CreateBuilder(args);
@@ -106,8 +106,8 @@ public sealed class Job2Runner
         {
             var jobUrl = Env("JOB_MCP_URL");
             var clipUrl = Env("CLIP_URL");
-            var apiKey = Env("ANTHROPIC_API_KEY");
-            var model = Environment.GetEnvironmentVariable("ANTHROPIC_MODEL") ?? "claude-sonnet-5-5";
+            var apiKey = Env("OPENROUTER_API_KEY");
+            var model = Environment.GetEnvironmentVariable("OPENROUTER_MODEL") is { Length: > 0 } m ? m : "anthropic/claude-sonnet-5.5";
             st.Model = model;
 
             await using var mcp = await McpClient.CreateAsync(new HttpClientTransport(new HttpClientTransportOptions
@@ -140,9 +140,13 @@ public sealed class Job2Runner
             {
                 tools.Add(new JsonObject
                 {
-                    ["name"] = t.Name,
-                    ["description"] = t.Description ?? "",
-                    ["input_schema"] = JsonNode.Parse(t.ProtocolTool.InputSchema.GetRawText()),
+                    ["type"] = "function",
+                    ["function"] = new JsonObject
+                    {
+                        ["name"] = t.Name,
+                        ["description"] = t.Description ?? "",
+                        ["parameters"] = JsonNode.Parse(t.ProtocolTool.InputSchema.GetRawText()),
+                    },
                 });
             }
 
@@ -155,6 +159,7 @@ public sealed class Job2Runner
 
             var messages = new JsonArray
             {
+                new JsonObject { ["role"] = "system", ["content"] = system },
                 new JsonObject { ["role"] = "user", ["content"] = "Run job 2 now, following the skill from step 1 to submit." },
             };
 
@@ -162,65 +167,62 @@ public sealed class Job2Runner
             for (var turn = 1; turn <= maxTurns; turn++)
             {
                 var sw = Stopwatch.StartNew();
-                var resp = await CallClaudeAsync(apiKey, model, system, tools, messages);
+                var resp = await CallOpenRouterAsync(apiKey, model, tools, messages);
                 sw.Stop();
-                st.InputTokens += resp["usage"]?["input_tokens"]?.GetValue<int>() ?? 0;
-                st.OutputTokens += resp["usage"]?["output_tokens"]?.GetValue<int>() ?? 0;
+                st.InputTokens += resp["usage"]?["prompt_tokens"]?.GetValue<int>() ?? 0;
+                st.OutputTokens += resp["usage"]?["completion_tokens"]?.GetValue<int>() ?? 0;
 
-                var content = resp["content"]!.AsArray();
-                messages.Add(new JsonObject { ["role"] = "assistant", ["content"] = content.DeepClone() });
-                var text = string.Join("\n", content.Where(c => c?["type"]?.GetValue<string>() == "text")
-                                                    .Select(c => c!["text"]!.GetValue<string>()));
+                var msg = resp["choices"]?[0]?["message"]?.AsObject()
+                          ?? throw new InvalidOperationException($"OpenRouter reply has no message: {Clip(resp.ToJsonString(), 500)}");
+                var assistant = new JsonObject { ["role"] = "assistant", ["content"] = msg["content"]?.DeepClone() };
+                if (msg["tool_calls"] is JsonArray tcs && tcs.Count > 0) assistant["tool_calls"] = tcs.DeepClone();
+                messages.Add(assistant);
+                var text = msg["content"]?.GetValueKind() == JsonValueKind.String ? msg["content"]!.GetValue<string>() : "";
                 st.Trace.Add(new TraceEntry(turn, "generation", model, "", Clip(text, 1500), sw.ElapsedMilliseconds));
 
-                var toolUses = content.Where(c => c?["type"]?.GetValue<string>() == "tool_use").ToList();
-                if (toolUses.Count == 0)
+                var toolCalls = (msg["tool_calls"] as JsonArray)?.ToList() ?? new();
+                if (toolCalls.Count == 0)
                 {
                     st.FinalMessage = text;
                     break;
                 }
 
-                var results = new JsonArray();
-                foreach (var tu in toolUses)
+                foreach (var tc in toolCalls)
                 {
-                    var name = tu!["name"]!.GetValue<string>();
-                    var id = tu["id"]!.GetValue<string>();
-                    var inputJson = tu["input"]?.ToJsonString() ?? "{}";
-                    var args = JsonSerializer.Deserialize<Dictionary<string, object?>>(inputJson) ?? new();
+                    var name = tc!["function"]!["name"]!.GetValue<string>();
+                    var id = tc["id"]!.GetValue<string>();
+                    var inputJson = tc["function"]?["arguments"]?.GetValue<string>() is { Length: > 0 } a ? a : "{}";
 
                     var tsw = Stopwatch.StartNew();
                     string output;
-                    bool isError;
                     try
                     {
+                        var args = JsonSerializer.Deserialize<Dictionary<string, object?>>(inputJson) ?? new();
                         var r = await mcp.CallToolAsync(name, args);
                         var parts = r.Content.OfType<TextContentBlock>().Select(b => b.Text).ToList();
                         if (r.StructuredContent is { } sc) parts.Add(sc.ToString());
                         output = string.Join("\n", parts);
-                        isError = r.IsError == true;
-                        if (name == "submit" && !isError)
+                        if (r.IsError == true) output = "ERROR: " + output;
+                        else if (name == "submit")
                         {
                             st.SubmitResult = output;
                             st.SubmitStructured = r.StructuredContent is { } s2 ? JsonNode.Parse(s2.ToString()) : null;
-                            st.SubmittedNotes = tu["input"]?["notes"]?.ToString() ?? inputJson;
+                            st.SubmittedNotes = JsonNode.Parse(inputJson)?["notes"]?.ToString() ?? inputJson;
                         }
                     }
                     catch (Exception ex)
                     {
-                        output = $"Tool call failed: {ex.Message}";
-                        isError = true;
+                        output = $"ERROR: tool call failed: {ex.Message}";
                     }
                     tsw.Stop();
                     st.Trace.Add(new TraceEntry(turn, "tool", name, Clip(inputJson), Clip(output), tsw.ElapsedMilliseconds));
-                    results.Add(new JsonObject
+                    messages.Add(new JsonObject
                     {
-                        ["type"] = "tool_result",
-                        ["tool_use_id"] = id,
+                        ["role"] = "tool",
+                        ["tool_call_id"] = id,
                         ["content"] = output,
-                        ["is_error"] = isError,
                     });
                 }
-                messages.Add(new JsonObject { ["role"] = "user", ["content"] = results });
             }
 
             st.Status = st.SubmitResult is null ? "failed" : "done";
@@ -239,31 +241,38 @@ public sealed class Job2Runner
         }
     }
 
-    private static async Task<JsonNode> CallClaudeAsync(string apiKey, string model, string system, JsonArray tools, JsonArray messages)
+    private static async Task<JsonNode> CallOpenRouterAsync(string apiKey, string model, JsonArray tools, JsonArray messages)
     {
         var body = new JsonObject
         {
             ["model"] = model,
             ["max_tokens"] = 8000,
-            ["system"] = system,
             ["tools"] = tools.DeepClone(),
             ["messages"] = messages.DeepClone(),
         };
         for (var attempt = 1; ; attempt++)
         {
-            using var req = new HttpRequestMessage(HttpMethod.Post, "https://api.anthropic.com/v1/messages")
+            using var req = new HttpRequestMessage(HttpMethod.Post, "https://openrouter.ai/api/v1/chat/completions")
             {
                 Content = new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json"),
             };
-            req.Headers.Add("x-api-key", apiKey);
-            req.Headers.Add("anthropic-version", "2023-06-01");
+            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+            req.Headers.Add("X-Title", "two-places-job2");
             req.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
             using var resp = await Http.SendAsync(req);
             var raw = await resp.Content.ReadAsStringAsync();
-            if (resp.IsSuccessStatusCode) return JsonNode.Parse(raw)!;
-            var retryable = (int)resp.StatusCode is 429 or 500 or 502 or 503 or 529;
-            if (!retryable || attempt >= 4)
-                throw new InvalidOperationException($"Claude API {(int)resp.StatusCode}: {Clip(raw, 500)}");
+            if (resp.IsSuccessStatusCode)
+            {
+                var node = JsonNode.Parse(raw)!;
+                if (node["error"] is null) return node;
+                if (attempt >= 4) throw new InvalidOperationException($"OpenRouter error: {Clip(raw, 500)}");
+            }
+            else
+            {
+                var retryable = (int)resp.StatusCode is 408 or 429 or 500 or 502 or 503 or 529;
+                if (!retryable || attempt >= 4)
+                    throw new InvalidOperationException($"OpenRouter {(int)resp.StatusCode}: {Clip(raw, 500)}");
+            }
             await Task.Delay(TimeSpan.FromSeconds(2 * attempt));
         }
     }
